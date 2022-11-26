@@ -1,4 +1,8 @@
-use color_eyre::Result;
+use color_eyre::eyre::{bail, ensure, Result, WrapErr};
+use tokio::{
+    fs::File,
+    net::{TcpListener, TcpStream},
+};
 use tracing::info;
 
 fn install_eyre() -> Result<()> {
@@ -27,13 +31,43 @@ fn install_tracing() -> Result<()> {
     Ok(())
 }
 
+async fn run_server() -> Result<()> {
+    info!("✨ running the hub at 0.0.0.0:1337!");
+
+    let listener = TcpListener::bind(("0.0.0.0", 1337)).await?;
+
+    loop {
+        let (mut socket, peer_addr) = listener.accept().await?;
+        info!(?peer_addr, "connected");
+        let mut file = File::open("Cargo.toml")
+            .await
+            .wrap_err("cannot open Cargo.toml")?;
+        tokio::io::copy(&mut file, &mut socket).await?;
+    }
+}
+
+async fn run_client() -> Result<()> {
+    info!("✨ running the spoke!");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_tracing()?;
     install_eyre()?;
 
-    info!("haha");
-    println!("Hello, world!");
+    let args: Vec<_> = std::env::args().collect();
+    ensure!(args.len() == 2, "which peer to run: `server` or `client`?");
+
+    let peer = &args[1];
+
+    if peer == "server" {
+        run_server().await?;
+    } else if peer == "client" {
+        run_client().await?;
+    } else {
+        bail!("which peer to run: `server` or `client`?");
+    }
 
     Ok(())
 }
