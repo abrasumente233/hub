@@ -1,9 +1,10 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use color_eyre::eyre::{bail, ensure, Result, WrapErr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 // Ideally when a client wants to connect with the serivce,
 // through the hub, it connects to a port that the hub listens
@@ -67,6 +68,12 @@ enum Message {
 
     /// Used by client to indicate it's a tunnel connection
     Tunnel = 2,
+
+    /// Used by server to acknowledge a message sent by the client
+    Ack = 3,
+
+    /// Used by server to tell the spoke to establish a tunnel connection
+    Accept = 4,
 }
 
 impl From<u8> for Message {
@@ -75,6 +82,8 @@ impl From<u8> for Message {
         match message {
             1 => Coord,
             2 => Tunnel,
+            3 => Ack,
+            4 => Accept,
             _ => unreachable!(),
         }
     }
@@ -86,6 +95,8 @@ impl From<Message> for u8 {
         match message {
             Coord => 1,
             Tunnel => 2,
+            Ack => 3,
+            Accept => 4,
         }
     }
 }
@@ -111,6 +122,7 @@ async fn run_server() -> Result<()> {
         message == Message::Coord,
         "wanted to establish a coordination connection with spoke, but spoke refused"
     );
+    coord.write_u8(Message::Ack.into()).await?;
 
     // todo: what happens the serivce conn breaks afterwards? reconnect.
 
@@ -118,19 +130,46 @@ async fn run_server() -> Result<()> {
 
     info!("anyone who want to access the service can go to 0.0.0.0:1337");
     loop {
-        let (mut socket, peer_addr) = listener.accept().await?;
+        let (socket, peer_addr) = listener.accept().await?;
         info!(?peer_addr, "connected");
 
-        tokio::io::copy_bidirectional(&mut socket, &mut coord).await?;
+        // todo: one connection failure shouldn't bring down the whole system
+        server_handle_connection(&mut coord, socket, peer_addr).await?;
     }
 }
 
-async fn run_client() -> Result<()> {
-    info!("✨ running the spoke!");
+#[instrument(skip(coord, client))]
+async fn server_handle_connection(
+    coord: &mut TcpStream,
+    mut client: TcpStream,
+    addr: SocketAddr,
+) -> Result<()> {
+    info!("asking the spoke to open up a tunnel");
+
+    let listener = TcpListener::bind(("0.0.0.0", 4242)).await?;
+    coord.write_u8(Message::Accept.into()).await?;
+    let (mut tunnel, tunnel_addr) = listener.accept().await?;
+    let message: Message = tunnel.read_u8().await?.into();
+    ensure!(
+        message == Message::Tunnel,
+        "expected spoke to connect to establish a tunnel"
+    );
+    tunnel.write_u8(Message::Ack.into()).await?;
+    info!(?tunnel_addr, "tunnel established");
+
+    tokio::io::copy_bidirectional(&mut client, &mut tunnel).await?;
+
+    info!("closed");
+    Ok(())
+}
+
+#[instrument]
+async fn client_accept() -> Result<()> {
+    info!("since the hub asked, we are opening a tunnel to hub");
 
     // open up connection from spoke to the hub
     info!("connecting to the hub 127.0.0.1:4242");
-    let mut conn = loop {
+    let mut tunnel = loop {
         match TcpStream::connect(("127.0.0.1", 4242)).await {
             Ok(conn) => break conn,
             Err(err) => {
@@ -140,16 +179,24 @@ async fn run_client() -> Result<()> {
         }
     };
     info!("connected to the hub");
-    info!("trying to establish a coordination connection");
+    info!("trying to establish a tunnel connection");
 
-    conn.write_u8(Message::Coord.into())
+    tunnel
+        .write_u8(Message::Tunnel.into())
         .await
         .wrap_err("failed to establish coordination connection with the hub")?;
 
-    info!("coordination connection established");
-    // todo: what if hub disconnects afterwards?
+    info!("hub please open up a tunnel");
 
-    info!("connecting to the serivce to be proxyed: 127.0.0.1:4444");
+    let message: Message = tunnel.read_u8().await?.into();
+    ensure!(
+        message == Message::Ack,
+        "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
+    );
+
+    info!("tunnel established");
+
+    info!("connecting to local serivce");
 
     // use some retry backoffs?
     let mut service = loop {
@@ -162,13 +209,60 @@ async fn run_client() -> Result<()> {
         }
     };
 
-    // since our `File` is `AsyncRead`-only, we `copy` instead
-    // of `copy_bidirectional`, for now
+    info!("connected to local serivce, proxying");
+
     // todo: what does copy do, exactly? copy tcp data sections?
     // what if serivce shutdown early? reconnect?
-    tokio::io::copy_bidirectional(&mut service, &mut conn).await?;
+    tokio::io::copy_bidirectional(&mut service, &mut tunnel).await?;
+
+    info!("closed");
 
     Ok(())
+}
+
+async fn run_client() -> Result<()> {
+    info!("✨ running the spoke!");
+
+    // open up connection from spoke to the hub
+    info!("connecting to the hub 127.0.0.1:4242");
+    let mut coord = loop {
+        match TcpStream::connect(("127.0.0.1", 4242)).await {
+            Ok(conn) => break conn,
+            Err(err) => {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                warn!(?err, "failed to connect to the hub 127.0.0.1:4242");
+            }
+        }
+    };
+    info!("connected to the hub");
+    info!("trying to establish a coordination connection");
+
+    coord
+        .write_u8(Message::Coord.into())
+        .await
+        .wrap_err("failed to establish coordination connection with the hub")?;
+
+    let message: Message = coord.read_u8().await?.into();
+    ensure!(
+        message == Message::Ack,
+        "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
+    );
+
+    info!("coordination connection established");
+    // todo: what if hub disconnects afterwards?
+
+    info!("waiting for server to ask us to open a tunnel, because the server can't do that itself");
+    loop {
+        let message: Message = coord.read_u8().await?.into();
+        match message {
+            Message::Coord => unreachable!(),
+            Message::Tunnel => unreachable!(),
+            Message::Ack => unreachable!(),
+            Message::Accept => {
+                client_accept().await?;
+            }
+        }
+    }
 }
 
 #[tokio::main]
