@@ -80,10 +80,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0acbd8d28a0a60d7108d7ae850af6ba34cf2d1257fc646980e5f97ce14275966"
 dependencies = [
  "bitflags",
+ "clap_derive",
  "clap_lex",
  "is-terminal",
+ "once_cell",
  "strsim",
  "termcolor",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0177313f9f02afc995627906bbd8967e2be069f5261954222dac78290c2b9014"
+dependencies = [
+ "heck",
+ "proc-macro-error",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -140,21 +155,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "getrandom"
-version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c05aeb6a22b8f62540c194aac980f2115af067bfe15a0734d7277a768d396b31"
-dependencies = [
- "cfg-if",
- "libc",
- "wasi",
-]
-
-[[package]]
 name = "gimli"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22030e2c5a68ec659fde1e949a745124b48e6fa8b045b7ed5bd1fe4ccc5c4e5d"
+
+[[package]]
+name = "heck"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2540771e65fc8cb83cd6e8a237f70c319bd5c29f78ed1084ba5d50eeac86f7f9"
 
 [[package]]
 name = "hermit-abi"
@@ -181,7 +191,6 @@ dependencies = [
  "clap",
  "color-eyre",
  "tokio",
- "tokio-retry",
  "tracing",
  "tracing-subscriber",
  "tracing-tree",
@@ -365,36 +374,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "pin-project"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad29a609b6bcd67fee905812e544992d216af9d755757c05ed2d0e15a74c6ecc"
-dependencies = [
- "pin-project-internal",
-]
-
-[[package]]
-name = "pin-project-internal"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "069bdb1e05adc7a8990dce9cc75370895fbe4e3d58b9b73bf1aee56359344a55"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0a7ae3ac2f1173085d398531c705756c94a4c56843785df85a60c1a0afac116"
 
 [[package]]
-name = "ppv-lite86"
-version = "0.2.17"
+name = "proc-macro-error"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b40af805b3121feab8a3c29f04d8ad262fa8e0561883e7653e024ae4479e6de"
+checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
+dependencies = [
+ "proc-macro-error-attr",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "version_check",
+]
+
+[[package]]
+name = "proc-macro-error-attr"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1be40180e52ecc98ad80b184934baf3d0d29f979574e439af5a55274b35f869"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "version_check",
+]
 
 [[package]]
 name = "proc-macro2"
@@ -412,36 +419,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbe448f377a7d6961e30f5955f9b8d106c3f5e449d493ee1b125c1d43c2b5179"
 dependencies = [
  "proc-macro2",
-]
-
-[[package]]
-name = "rand"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
-dependencies = [
- "libc",
- "rand_chacha",
- "rand_core",
-]
-
-[[package]]
-name = "rand_chacha"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
-dependencies = [
- "ppv-lite86",
- "rand_core",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
-dependencies = [
- "getrandom",
 ]
 
 [[package]]
@@ -604,17 +581,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-retry"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f57eb36ecbe0fc510036adff84824dd3c24bb781e21bfa67b69d556aa85214f"
-dependencies = [
- "pin-project",
- "rand",
- "tokio",
-]
-
-[[package]]
 name = "tracing"
 version = "0.1.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -700,6 +666,12 @@ name = "valuable"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b7e5d4d90034032940e4ace0d9a9a057e7a45cd94e6c007832e39edb82f6d"
+
+[[package]]
+name = "version_check"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 
 [[package]]
 name = "wasi"
