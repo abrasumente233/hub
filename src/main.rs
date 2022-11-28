@@ -275,48 +275,62 @@ async fn client_accept() -> Result<()> {
 async fn run_client() -> Result<()> {
     info!("✨ running the spoke!");
 
-    // open up connection from spoke to the hub
-    info!("connecting to the hub 127.0.0.1:4242");
-    let mut coord = loop {
-        match TcpStream::connect(("127.0.0.1", 4242)).await {
-            Ok(conn) => break conn,
-            Err(err) => {
-                tokio::time::sleep(Duration::from_secs(3)).await;
-                warn!(?err, "failed to connect to the hub 127.0.0.1:4242");
+    'outer: loop {
+        // open up connection from spoke to the hub
+        info!("connecting to the hub 127.0.0.1:4242");
+        let mut coord = loop {
+            match TcpStream::connect(("127.0.0.1", 4242)).await {
+                Ok(conn) => break conn,
+                Err(err) => {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    warn!(?err, "failed to connect to the hub 127.0.0.1:4242");
+                }
             }
-        }
-    };
-    info!("connected to the hub");
-    info!("trying to establish a coordination connection");
+        };
+        info!("connected to the hub");
+        info!("trying to establish a coordination connection");
 
-    coord
-        .write_u8(Message::Coord.into())
-        .await
-        .wrap_err("failed to establish coordination connection with the hub")?;
+        coord
+            .write_u8(Message::Coord.into())
+            .await
+            .wrap_err("failed to establish coordination connection with the hub")?;
 
-    let message: Message = coord.read_u8().await?.into();
-    ensure!(
+        let message: Message = coord.read_u8().await?.into();
+        ensure!(
         message == Message::Ack,
         "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
     );
 
-    info!("coordination connection established");
-    // todo: what if hub disconnects afterwards?
+        info!("coordination connection established");
+        // todo: what if hub disconnects afterwards?
 
-    info!("waiting for server to ask us to open a tunnel, because the server can't do that itself");
-    loop {
-        let message: Message = coord.read_u8().await?.into();
-        match message {
-            Message::Coord => unreachable!(),
-            Message::Tunnel => unreachable!(),
-            Message::Ack => unreachable!(),
-            Message::Accept => {
-                tokio::spawn(async move {
-                    // todo: single failure shouldn't bring down the whole system
-                    if let Err(err) = client_accept().await {
-                        warn!(?err, "client enountered an error when proxying");
-                    }
-                });
+        info!("waiting for server to ask us to open a tunnel, because the server can't do that itself");
+        loop {
+            let message: Message = match coord
+                .read_u8()
+                .await
+                .wrap_err("coordination channel encounters unexpected EOF, is the hub down?")
+            {
+                Ok(message) => message,
+                Err(err) => {
+                    warn!(?err);
+                    continue 'outer;
+                }
+            }
+            .into();
+            match message {
+                Message::Coord => unreachable!(),
+                Message::Tunnel => unreachable!(),
+                Message::Ack => unreachable!(),
+                Message::Accept => {
+                    // todo: coord or tunnel error? actions depend on type of error.
+                    tokio::spawn(async move {
+                        // todo: single failure shouldn't bring down the whole system
+                        if let Err(err) = client_accept().await {
+                            warn!(?err, "client enountered an error when proxying");
+                        }
+                    });
+                }
             }
         }
     }
