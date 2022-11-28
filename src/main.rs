@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use color_eyre::eyre::{bail, ensure, Result, WrapErr};
@@ -114,6 +115,7 @@ async fn run_server() -> Result<()> {
         // note: listener is dropped here to prevent mutiple spokes connected in
         stream
     };
+    // todo: what happens the coordination conn breaks afterwards? reconnect.
 
     // really should use `tokio_util::codec`, but hey :), can't we be naive?
     // expect spoke to declare `coord` is a coordnation connection
@@ -124,7 +126,9 @@ async fn run_server() -> Result<()> {
     );
     coord.write_u8(Message::Ack.into()).await?;
 
-    // todo: what happens the serivce conn breaks afterwards? reconnect.
+    // coordinator will be shared between threads, to notify the spoke to open up a tunnel
+    // todo: it's sad to use tokio's mutex
+    let coord = Arc::new(tokio::sync::Mutex::new(coord));
 
     let listener = TcpListener::bind(("0.0.0.0", 1337)).await?;
 
@@ -133,22 +137,33 @@ async fn run_server() -> Result<()> {
         let (socket, peer_addr) = listener.accept().await?;
         info!(?peer_addr, "connected");
 
-        // todo: one connection failure shouldn't bring down the whole system
-        server_handle_connection(&mut coord, socket, peer_addr).await?;
+        let coord = coord.clone();
+
+        tokio::spawn(async move {
+            // todo: one connection failure shouldn't bring down the whole system
+            server_handle_connection(coord, socket, peer_addr)
+                .await
+                .unwrap();
+        });
     }
 }
 
 #[instrument(skip(coord, client))]
 async fn server_handle_connection(
-    coord: &mut TcpStream,
+    coord: Arc<tokio::sync::Mutex<TcpStream>>,
     mut client: TcpStream,
     addr: SocketAddr,
 ) -> Result<()> {
     info!("asking the spoke to open up a tunnel");
 
-    let listener = TcpListener::bind(("0.0.0.0", 4242)).await?;
-    coord.write_u8(Message::Accept.into()).await?;
-    let (mut tunnel, tunnel_addr) = listener.accept().await?;
+    let (mut tunnel, tunnel_addr) = {
+        // todo: we're using the coordinator lock to prevent mutiple threads
+        // from listening on the same port, what are we doing?
+        let mut coord = coord.lock().await;
+        let listener = TcpListener::bind(("0.0.0.0", 4242)).await?;
+        coord.write_u8(Message::Accept.into()).await?;
+        listener.accept().await?
+    };
     let message: Message = tunnel.read_u8().await?.into();
     ensure!(
         message == Message::Tunnel,
@@ -259,7 +274,10 @@ async fn run_client() -> Result<()> {
             Message::Tunnel => unreachable!(),
             Message::Ack => unreachable!(),
             Message::Accept => {
-                client_accept().await?;
+                tokio::spawn(async move {
+                    // todo: single failure shouldn't bring down the whole system
+                    client_accept().await.unwrap();
+                });
             }
         }
     }
