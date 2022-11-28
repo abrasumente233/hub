@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -11,6 +11,17 @@ use tracing::{info, instrument, warn};
 struct Args {
     #[command(subcommand)]
     command: Commands,
+}
+
+struct Hub {
+    exposed_addr: SocketAddr,
+    tunnel_addr: SocketAddr,
+    coord: Option<TcpStream>,
+}
+
+struct Spoke {
+    local_addr: SocketAddr,
+    tunnel_addr: SocketAddr,
 }
 
 #[derive(Subcommand)]
@@ -102,130 +113,143 @@ impl From<Message> for u8 {
     }
 }
 
-/// Used by server to establish a connection with the spoke.
-///
-/// If `coord` is `Some`, this function will try to establish a
-/// tunnel connection, otherwise a coordination connection.
-async fn server_establish(
-    coord: Option<&mut TcpStream>,
-    port: u16,
-) -> Result<(TcpStream, SocketAddr)> {
-    // todo: retry if at all question marks, only return error when timeout or
-    // exceeded maximum retries.
-    let is_tunnel = coord.is_some();
-    let (mut stream, addr) = {
-        let service_listener = TcpListener::bind(("0.0.0.0", port)).await?;
-        if is_tunnel {
-            coord.unwrap().write_u8(Message::Accept.into()).await?;
-        }
-
-        info!("waiting for spoke come up at 0.0.0.0:{}", port);
-        let (stream, addr) = service_listener.accept().await?;
-        info!(?addr, "spoke connected!");
-
-        // note: listener is dropped here to prevent mutiple spokes connected in
-        (stream, addr)
-    };
-    // todo: what happens the coordination conn breaks afterwards? reconnect.
-
-    // really should use `tokio_util::codec`, but hey :), can't we be naive?
-    // expect spoke to declare `coord` is a coordnation connection
-    let message: Message = stream.read_u8().await?.into();
-    ensure!(
-        message
-            == if is_tunnel {
-                Message::Tunnel
-            } else {
-                Message::Coord
-            },
-        "wrong type of connection established between the hub and spoke"
-    );
-    stream.write_u8(Message::Ack.into()).await?;
-
-    Ok((stream, addr))
-}
-
-async fn server_establish_with_timeout(
-    coord: Option<&mut TcpStream>,
-    port: u16,
-) -> Result<(TcpStream, SocketAddr)> {
-    tokio::time::timeout(Duration::from_secs(3), server_establish(coord, port))
-        .await
-        .wrap_err("timeout establishing connection to the spoke, is the spoke down?")?
-}
-
-// it's going banana cakes, the amount of failure points is getting
-// crazy at this point. for example, any coordination error will boil
-// down to reconnecting, but how do you know, when calling a function,
-// if coordination breaks?
-async fn run_server(exposed_port: u16, tunnel_port: u16) -> Result<()> {
-    info!(
-        "✨ running the hub at < exposed=0.0.0.0:{}, tunnel=0.0.0.0:{} >!",
-        exposed_port, tunnel_port
-    );
-
-    'outer: loop {
-        // if we can't establish coordination, there's nothing we can do, so bail out.
-        info!("trying to establish coordination connection");
-        let (mut coord, _) = loop {
-            match server_establish_with_timeout(None, tunnel_port).await {
-                Ok(conn) => break conn,
-                Err(_) => {
-                    warn!("can't connect to spoke to establish coordination connection");
-                }
-            }
-        };
-        info!("established coordination connection");
-
-        let listener = TcpListener::bind(("0.0.0.0", exposed_port)).await?;
-
-        info!(
-            "anyone who want to access the service can go to 0.0.0.0:{}",
-            exposed_port
-        );
-        loop {
-            let (client, client_addr) = listener.accept().await?;
-
-            // todo: again, one failure shouldn't bring down the whole system
-            match handle_server_connection(&mut coord, client, client_addr, tunnel_port).await {
-                Ok(_) => (),
-                Err(err) => {
-                    warn!(?err);
-                    continue 'outer;
-                }
-            };
+impl Hub {
+    fn new<A1, A2>(exposed_addr: A1, tunnel_addr: A2) -> Self
+    where
+        A1: ToSocketAddrs,
+        A2: ToSocketAddrs,
+    {
+        Self {
+            exposed_addr: exposed_addr.to_socket_addrs().unwrap().next().unwrap(),
+            tunnel_addr: tunnel_addr.to_socket_addrs().unwrap().next().unwrap(),
+            coord: None,
         }
     }
-}
 
-/// Returns error when we can't connect to the spoke
-#[instrument(skip(coord, client))]
-async fn handle_server_connection(
-    coord: &mut TcpStream,
-    mut client: TcpStream,
-    client_addr: SocketAddr,
-    tunnel_port: u16,
-) -> Result<()> {
-    info!(?client_addr, "connected");
+    // it's going banana cakes, the amount of failure points is getting
+    // crazy at this point. for example, any coordination error will boil
+    // down to reconnecting, but how do you know, when calling a function,
+    // if coordination breaks?
+    async fn run(&mut self) -> Result<()> {
+        info!(
+            "✨ running the hub at < exposed_addr={}, tunnel_addr={} >!",
+            self.exposed_addr, self.tunnel_addr
+        );
 
-    info!("asking the spoke to open up a tunnel");
+        'outer: loop {
+            // if we can't establish coordination, there's nothing we can do, so bail out.
+            info!("trying to establish coordination connection");
+            let (coord, _) = loop {
+                match self.server_establish_with_timeout().await {
+                    Ok(conn) => break conn,
+                    Err(_) => {
+                        warn!("can't connect to spoke to establish coordination connection");
+                    }
+                }
+            };
+            self.coord.replace(coord);
+            info!("established coordination connection");
 
-    let (mut tunnel, tunnel_addr) = server_establish_with_timeout(Some(coord), tunnel_port)
-        .await
-        .wrap_err("cannot open tunnel")?;
+            let listener = TcpListener::bind(self.exposed_addr).await?;
 
-    info!(?tunnel_addr, "tunnel established");
+            info!(
+                "anyone who want to access the service can go to {}",
+                self.exposed_addr
+            );
+            loop {
+                let (client, client_addr) = listener.accept().await?;
 
-    tokio::spawn(async move {
-        // todo: one connection failure shouldn't bring down the whole system
-        tokio::io::copy_bidirectional(&mut client, &mut tunnel)
+                // todo: again, one failure shouldn't bring down the whole system
+                match self.handle_server_connection(client, client_addr).await {
+                    Ok(_) => (),
+                    Err(err) => {
+                        warn!(?err);
+                        continue 'outer;
+                    }
+                };
+            }
+        }
+    }
+
+    /// Returns error when we can't connect to the spoke
+    #[instrument(skip(self, client))]
+    async fn handle_server_connection(
+        &mut self,
+        mut client: TcpStream,
+        client_addr: SocketAddr,
+    ) -> Result<()> {
+        info!(?client_addr, "connected");
+
+        info!("asking the spoke to open up a tunnel");
+
+        let (mut tunnel, tunnel_addr) = self
+            .server_establish_with_timeout()
             .await
-            .unwrap();
+            .wrap_err("cannot open tunnel")?;
 
-        info!("closed");
-    });
+        info!(?tunnel_addr, "tunnel established");
 
-    Ok(())
+        tokio::spawn(async move {
+            // todo: one connection failure shouldn't bring down the whole system
+            tokio::io::copy_bidirectional(&mut client, &mut tunnel)
+                .await
+                .unwrap();
+
+            info!("closed");
+        });
+
+        Ok(())
+    }
+
+    /// Used by server to establish a connection with the spoke.
+    ///
+    /// If `coord` is `Some`, this function will try to establish a
+    /// tunnel connection, otherwise a coordination connection.
+    async fn server_establish(&mut self) -> Result<(TcpStream, SocketAddr)> {
+        // todo: retry if at all question marks, only return error when timeout or
+        // exceeded maximum retries.
+        let is_tunnel = self.coord.is_some();
+        let (mut stream, addr) = {
+            let service_listener = TcpListener::bind(self.tunnel_addr).await?;
+            if is_tunnel {
+                self.coord
+                    .as_mut()
+                    .unwrap()
+                    .write_u8(Message::Accept.into())
+                    .await?;
+            }
+
+            info!("waiting for spoke come up at {}", self.tunnel_addr);
+            let (stream, addr) = service_listener.accept().await?;
+            info!(?addr, "spoke connected!");
+
+            // note: listener is dropped here to prevent mutiple spokes connected in
+            (stream, addr)
+        };
+        // todo: what happens the coordination conn breaks afterwards? reconnect.
+
+        // really should use `tokio_util::codec`, but hey :), can't we be naive?
+        // expect spoke to declare `coord` is a coordnation connection
+        let message: Message = stream.read_u8().await?.into();
+        ensure!(
+            message
+                == if is_tunnel {
+                    Message::Tunnel
+                } else {
+                    Message::Coord
+                },
+            "wrong type of connection established between the hub and spoke"
+        );
+        stream.write_u8(Message::Ack.into()).await?;
+
+        Ok((stream, addr))
+    }
+
+    async fn server_establish_with_timeout(&mut self) -> Result<(TcpStream, SocketAddr)> {
+        tokio::time::timeout(Duration::from_secs(3), self.server_establish())
+            .await
+            .wrap_err("timeout establishing connection to the spoke, is the spoke down?")?
+    }
 }
 
 #[instrument]
@@ -379,7 +403,9 @@ async fn main() -> Result<()> {
 
     match args.command {
         Commands::Hub { port, tunnel_port } => {
-            run_server(port, tunnel_port).await?;
+            Hub::new(("0.0.0.0", port), ("0.0.0.0", tunnel_port))
+                .run()
+                .await?;
         }
         Commands::Spoke { port, tunnel_port } => {
             run_client(port, tunnel_port).await?;
