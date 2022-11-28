@@ -5,7 +5,7 @@ use std::time::Duration;
 use color_eyre::eyre::{bail, ensure, Result, WrapErr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument, trace_span, warn};
 
 // Ideally when a client wants to connect with the serivce,
 // through the hub, it connects to a port that the hub listens
@@ -102,79 +102,92 @@ impl From<Message> for u8 {
     }
 }
 
-async fn run_server() -> Result<()> {
-    info!("✨ running the hub at 0.0.0.0:1337!");
-
-    let mut coord = {
+/// Used by server to establish a connection with the spoke.
+///
+/// If `coord` is `Some`, this function will try to establish a
+/// tunnel connection, otherwise a coordination connection.
+async fn server_establish(coord: Option<&mut TcpStream>) -> Result<(TcpStream, SocketAddr)> {
+    // todo: retry if at all question marks, only return error when timeout or
+    // exceeded maximum retries.
+    let is_tunnel = coord.is_some();
+    let (mut stream, addr) = {
         let service_listener = TcpListener::bind(("0.0.0.0", 4242)).await?;
+        if is_tunnel {
+            coord.unwrap().write_u8(Message::Accept.into()).await?;
+        }
 
         info!("waiting for spoke come up at 0.0.0.0:4242");
         let (stream, addr) = service_listener.accept().await?;
         info!(?addr, "spoke connected!");
 
         // note: listener is dropped here to prevent mutiple spokes connected in
-        stream
+        (stream, addr)
     };
     // todo: what happens the coordination conn breaks afterwards? reconnect.
 
     // really should use `tokio_util::codec`, but hey :), can't we be naive?
     // expect spoke to declare `coord` is a coordnation connection
-    let message: Message = coord.read_u8().await?.into();
+    let message: Message = stream.read_u8().await?.into();
     ensure!(
-        message == Message::Coord,
-        "wanted to establish a coordination connection with spoke, but spoke refused"
+        message
+            == if is_tunnel {
+                Message::Tunnel
+            } else {
+                Message::Coord
+            },
+        "wrong type of connection established between the hub and spoke"
     );
-    coord.write_u8(Message::Ack.into()).await?;
+    stream.write_u8(Message::Ack.into()).await?;
 
-    // coordinator will be shared between threads, to notify the spoke to open up a tunnel
-    // todo: it's sad to use tokio's mutex
-    let coord = Arc::new(tokio::sync::Mutex::new(coord));
+    Ok((stream, addr))
+}
+
+// it's going banana cakes, the amount of failure points is getting
+// crazy at this point. for example, any coordination error will boil
+// down to reconnecting, but how do you know, when calling a function,
+// if coordination breaks?
+async fn run_server() -> Result<()> {
+    info!("✨ running the hub at 0.0.0.0:1337!");
+
+    // if we can't establish coordination, there's nothing we can do, so bail out.
+    let (mut coord, _) = server_establish(None).await?;
 
     let listener = TcpListener::bind(("0.0.0.0", 1337)).await?;
 
     info!("anyone who want to access the service can go to 0.0.0.0:1337");
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
-        info!(?peer_addr, "connected");
+        let (client, client_addr) = listener.accept().await?;
 
-        let coord = coord.clone();
-
-        tokio::spawn(async move {
-            // todo: one connection failure shouldn't bring down the whole system
-            server_handle_connection(coord, socket, peer_addr)
-                .await
-                .unwrap();
-        });
+        // todo: again, one failure shouldn't bring down the whole system
+        handle_server_connection(&mut coord, client, client_addr)
+            .await
+            .unwrap();
     }
 }
 
-#[instrument(skip(coord, client))]
-async fn server_handle_connection(
-    coord: Arc<tokio::sync::Mutex<TcpStream>>,
+#[instrument]
+async fn handle_server_connection(
+    coord: &mut TcpStream,
     mut client: TcpStream,
-    addr: SocketAddr,
+    client_addr: SocketAddr,
 ) -> Result<()> {
+    info!(?client_addr, "connected");
+
     info!("asking the spoke to open up a tunnel");
 
-    let (mut tunnel, tunnel_addr) = {
-        // todo: we're using the coordinator lock to prevent mutiple threads
-        // from listening on the same port, what are we doing?
-        let mut coord = coord.lock().await;
-        let listener = TcpListener::bind(("0.0.0.0", 4242)).await?;
-        coord.write_u8(Message::Accept.into()).await?;
-        listener.accept().await?
-    };
-    let message: Message = tunnel.read_u8().await?.into();
-    ensure!(
-        message == Message::Tunnel,
-        "expected spoke to connect to establish a tunnel"
-    );
-    tunnel.write_u8(Message::Ack.into()).await?;
+    let (mut tunnel, tunnel_addr) = server_establish(Some(coord)).await?;
+
     info!(?tunnel_addr, "tunnel established");
 
-    tokio::io::copy_bidirectional(&mut client, &mut tunnel).await?;
+    tokio::spawn(async move {
+        // todo: one connection failure shouldn't bring down the whole system
+        tokio::io::copy_bidirectional(&mut client, &mut tunnel)
+            .await
+            .unwrap();
 
-    info!("closed");
+        info!("closed");
+    });
+
     Ok(())
 }
 
@@ -196,13 +209,15 @@ async fn client_accept() -> Result<()> {
     info!("connected to the hub");
     info!("trying to establish a tunnel connection");
 
+    // the hub side of the tunnel could be closed, for unexpected reasons
+    // resulting in an error when `write_u8`, not good not terrible, we could
+    // reconnect. but for now we just give up
     tunnel
         .write_u8(Message::Tunnel.into())
         .await
         .wrap_err("failed to establish coordination connection with the hub")?;
 
-    info!("hub please open up a tunnel");
-
+    // same error, could retry but whatever
     let message: Message = tunnel.read_u8().await?.into();
     ensure!(
         message == Message::Ack,
@@ -214,6 +229,9 @@ async fn client_accept() -> Result<()> {
     info!("connecting to local serivce");
 
     // use some retry backoffs?
+    // todo: maybe we shouldn't retry since it's local. when we can't connect,
+    // it's more likely that the service is down, rather than there's a
+    // network issue...
     let mut service = loop {
         match TcpStream::connect(("127.0.0.1", 4444)).await {
             Ok(conn) => break conn,
@@ -228,7 +246,9 @@ async fn client_accept() -> Result<()> {
 
     // todo: what does copy do, exactly? copy tcp data sections?
     // what if serivce shutdown early? reconnect?
-    tokio::io::copy_bidirectional(&mut service, &mut tunnel).await?;
+    tokio::io::copy_bidirectional(&mut service, &mut tunnel)
+        .await
+        .wrap_err("broken proxy between service and tunnel")?;
 
     info!("closed");
 
@@ -276,7 +296,9 @@ async fn run_client() -> Result<()> {
             Message::Accept => {
                 tokio::spawn(async move {
                     // todo: single failure shouldn't bring down the whole system
-                    client_accept().await.unwrap();
+                    if let Err(err) = client_accept().await {
+                        warn!(?err, "client enountered an error when proxying");
+                    }
                 });
             }
         }
