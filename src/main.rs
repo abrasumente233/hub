@@ -1,11 +1,10 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use color_eyre::eyre::{bail, ensure, Result, WrapErr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, instrument, trace_span, warn};
+use tracing::{info, instrument, warn};
 
 // Ideally when a client wants to connect with the serivce,
 // through the hub, it connects to a port that the hub listens
@@ -297,12 +296,11 @@ async fn run_client() -> Result<()> {
 
         let message: Message = coord.read_u8().await?.into();
         ensure!(
-        message == Message::Ack,
-        "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
-    );
+            message == Message::Ack,
+            "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
+        );
 
         info!("coordination connection established");
-        // todo: what if hub disconnects afterwards?
 
         info!("waiting for server to ask us to open a tunnel, because the server can't do that itself");
         loop {
@@ -323,11 +321,20 @@ async fn run_client() -> Result<()> {
                 Message::Tunnel => unreachable!(),
                 Message::Ack => unreachable!(),
                 Message::Accept => {
-                    // todo: coord or tunnel error? actions depend on type of error.
+                    // tunnel creation error, maybe because hub is down, or maybe because
+                    // of accident.
+                    //
+                    //   1. if the hub connection is down, next loop `read_u8` will error out,
+                    //      casuing reconnection to the hub.
+                    //   2. if by accident, retry is left as an exercise for the user.
+                    //
                     tokio::spawn(async move {
                         // todo: single failure shouldn't bring down the whole system
                         if let Err(err) = client_accept().await {
-                            warn!(?err, "client enountered an error when proxying");
+                            warn!(
+                                ?err,
+                                "client enountered an error when accepting a connection"
+                            );
                         }
                     });
                 }
