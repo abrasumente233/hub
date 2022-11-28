@@ -142,6 +142,14 @@ async fn server_establish(coord: Option<&mut TcpStream>) -> Result<(TcpStream, S
     Ok((stream, addr))
 }
 
+async fn server_establish_with_timeout(
+    coord: Option<&mut TcpStream>,
+) -> Result<(TcpStream, SocketAddr)> {
+    tokio::time::timeout(Duration::from_secs(3), server_establish(coord))
+        .await
+        .wrap_err("timeout establishing connection to the spoke, is the spoke down?")?
+}
+
 // it's going banana cakes, the amount of failure points is getting
 // crazy at this point. for example, any coordination error will boil
 // down to reconnecting, but how do you know, when calling a function,
@@ -149,23 +157,32 @@ async fn server_establish(coord: Option<&mut TcpStream>) -> Result<(TcpStream, S
 async fn run_server() -> Result<()> {
     info!("✨ running the hub at 0.0.0.0:1337!");
 
-    // if we can't establish coordination, there's nothing we can do, so bail out.
-    let (mut coord, _) = server_establish(None).await?;
+    'outer: loop {
+        // if we can't establish coordination, there's nothing we can do, so bail out.
+        info!("trying to establish coordination connection");
+        let (mut coord, _) = server_establish_with_timeout(None).await?;
+        info!("established coordination connection");
 
-    let listener = TcpListener::bind(("0.0.0.0", 1337)).await?;
+        let listener = TcpListener::bind(("0.0.0.0", 1337)).await?;
 
-    info!("anyone who want to access the service can go to 0.0.0.0:1337");
-    loop {
-        let (client, client_addr) = listener.accept().await?;
+        info!("anyone who want to access the service can go to 0.0.0.0:1337");
+        loop {
+            let (client, client_addr) = listener.accept().await?;
 
-        // todo: again, one failure shouldn't bring down the whole system
-        handle_server_connection(&mut coord, client, client_addr)
-            .await
-            .unwrap();
+            // todo: again, one failure shouldn't bring down the whole system
+            match handle_server_connection(&mut coord, client, client_addr).await {
+                Ok(_) => (),
+                Err(err) => {
+                    warn!(?err);
+                    continue 'outer;
+                }
+            };
+        }
     }
 }
 
-#[instrument]
+/// Returns error when we can't connect to the spoke
+#[instrument(skip(coord, client))]
 async fn handle_server_connection(
     coord: &mut TcpStream,
     mut client: TcpStream,
@@ -175,7 +192,7 @@ async fn handle_server_connection(
 
     info!("asking the spoke to open up a tunnel");
 
-    let (mut tunnel, tunnel_addr) = server_establish(Some(coord)).await?;
+    let (mut tunnel, tunnel_addr) = server_establish_with_timeout(Some(coord)).await?;
 
     info!(?tunnel_addr, "tunnel established");
 
