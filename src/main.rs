@@ -159,7 +159,18 @@ async fn run_server() -> Result<()> {
     'outer: loop {
         // if we can't establish coordination, there's nothing we can do, so bail out.
         info!("trying to establish coordination connection");
-        let (mut coord, _) = server_establish_with_timeout(None).await?;
+        let (mut coord, _) = loop {
+            match server_establish_with_timeout(None).await {
+                Ok(conn) => break conn,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "can't connect to spoke to establish coordination connection"
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        };
         info!("established coordination connection");
 
         let listener = TcpListener::bind(("0.0.0.0", 1337)).await?;
@@ -191,7 +202,9 @@ async fn handle_server_connection(
 
     info!("asking the spoke to open up a tunnel");
 
-    let (mut tunnel, tunnel_addr) = server_establish_with_timeout(Some(coord)).await?;
+    let (mut tunnel, tunnel_addr) = server_establish_with_timeout(Some(coord))
+        .await
+        .wrap_err("cannot open tunnel")?;
 
     info!(?tunnel_addr, "tunnel established");
 
