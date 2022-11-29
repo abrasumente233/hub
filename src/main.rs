@@ -5,24 +5,12 @@ use clap::{Parser, Subcommand};
 use color_eyre::eyre::{ensure, Result, WrapErr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, instrument, warn};
+use tracing::{info, instrument, trace, warn};
 
 #[derive(Parser)]
 struct Args {
     #[command(subcommand)]
     command: Commands,
-}
-
-struct Hub {
-    exposed_addr: SocketAddr,
-    tunnel_addr: SocketAddr,
-    coord: Option<TcpStream>,
-}
-
-#[derive(Clone)]
-struct Spoke {
-    local_addr: SocketAddr,
-    tunnel_addr: SocketAddr,
 }
 
 #[derive(Subcommand)]
@@ -51,6 +39,18 @@ enum Commands {
     },
 }
 
+struct Hub {
+    exposed_addr: SocketAddr,
+    tunnel_addr: SocketAddr,
+    ctrl: Option<TcpStream>,
+}
+
+#[derive(Clone)]
+struct Spoke {
+    local_addr: SocketAddr,
+    tunnel_addr: SocketAddr,
+}
+
 fn install_eyre() -> Result<()> {
     color_eyre::install()?;
     Ok(())
@@ -62,7 +62,7 @@ fn install_tracing() -> Result<()> {
 
     let env_filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
-        Err(_) => EnvFilter::default().add_directive("hub=trace".parse()?),
+        Err(_) => EnvFilter::default().add_directive("hub=info".parse()?),
     };
 
     Registry::default()
@@ -80,16 +80,16 @@ fn install_tracing() -> Result<()> {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Message {
-    /// Used by client to indicate it's a coordination connection
-    Coord = 1,
+    /// Used by spoke to open a control channel
+    Control = 1,
 
-    /// Used by client to indicate it's a tunnel connection
-    Tunnel = 2,
+    /// Used by spoke to open a data channel
+    Data = 2,
 
-    /// Used by server to acknowledge a message sent by the client
+    /// Used by hub to acknowledge a message sent by the spoke
     Ack = 3,
 
-    /// Used by server to tell the spoke to establish a tunnel connection
+    /// Used by hub to tell the spoke to open a data channel
     Accept = 4,
 }
 
@@ -97,8 +97,8 @@ impl From<u8> for Message {
     fn from(message: u8) -> Self {
         use Message::*;
         match message {
-            1 => Coord,
-            2 => Tunnel,
+            1 => Control,
+            2 => Data,
             3 => Ack,
             4 => Accept,
             _ => unreachable!(),
@@ -110,8 +110,8 @@ impl From<Message> for u8 {
     fn from(message: Message) -> Self {
         use Message::*;
         match message {
-            Coord => 1,
-            Tunnel => 2,
+            Control => 1,
+            Data => 2,
             Ack => 3,
             Accept => 4,
         }
@@ -127,7 +127,7 @@ impl Hub {
         Self {
             exposed_addr: exposed_addr.to_socket_addrs().unwrap().next().unwrap(),
             tunnel_addr: tunnel_addr.to_socket_addrs().unwrap().next().unwrap(),
-            coord: None,
+            ctrl: None,
         }
     }
 
@@ -137,40 +137,38 @@ impl Hub {
     // if coordination breaks?
     async fn run(&mut self) -> Result<()> {
         info!(
-            "✨ running the hub at < exposed_addr={}, tunnel_addr={} >!",
+            "✨ running the hub at {{exposed_addr={}, tunnel_addr={}}}!",
             self.exposed_addr, self.tunnel_addr
         );
 
         'outer: loop {
             // if we can't establish coordination, there's nothing we can do, so bail out.
-            info!("trying to establish coordination connection");
+            info!("opening control channel");
             let (coord, _) = loop {
                 match self.server_establish_with_timeout().await {
                     Ok(conn) => break conn,
                     Err(_) => {
-                        warn!("can't connect to spoke to establish coordination connection, is the spoke down?");
+                        warn!("can't open control channel, is the spoke down?");
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             };
-            self.coord.replace(coord);
-            info!("established coordination connection");
+            self.ctrl.replace(coord);
+            info!("✨ opened control channel!");
+            info!("all good! listening for connections");
 
             let listener = TcpListener::bind(self.exposed_addr).await?;
 
-            info!(
-                "anyone who want to access the service can go to {}",
-                self.exposed_addr
-            );
+            info!("service exposed at {}", self.exposed_addr);
             loop {
                 let (client, client_addr) = listener.accept().await?;
 
-                // todo: again, one failure shouldn't bring down the whole system
                 match self.handle_server_connection(client, client_addr).await {
                     Ok(_) => (),
                     Err(err) => {
                         warn!(?err);
-                        self.coord.take();
+                        // can't connect to the spoke, reconnect
+                        self.ctrl.take();
                         continue 'outer;
                     }
                 };
@@ -185,24 +183,27 @@ impl Hub {
         mut client: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        info!(?client_addr, "connected");
+        trace!(?client_addr, "connected");
 
-        info!("asking the spoke to open up a tunnel");
+        trace!("asking the spoke to open up a data channel");
 
         let (mut tunnel, tunnel_addr) = self
             .server_establish_with_timeout()
             .await
-            .wrap_err("cannot open tunnel")?;
+            .wrap_err("can't open data channel")?;
 
-        info!(?tunnel_addr, "tunnel established");
+        trace!(?tunnel_addr, "opened data channel");
+
+        info!("tunneling");
 
         tokio::spawn(async move {
             // todo: one connection failure shouldn't bring down the whole system
+            // fix this unwrap
             tokio::io::copy_bidirectional(&mut client, &mut tunnel)
                 .await
                 .unwrap();
 
-            info!("closed");
+            trace!("data channel closed");
         });
 
         Ok(())
@@ -215,27 +216,30 @@ impl Hub {
     async fn server_establish(&mut self) -> Result<(TcpStream, SocketAddr)> {
         // todo: retry if at all question marks, only return error when timeout or
         // exceeded maximum retries.
-        let is_tunnel = self.coord.is_some();
+        let is_tunnel = self.ctrl.is_some();
         let (mut stream, addr) = {
-            let service_listener = TcpListener::bind(self.tunnel_addr)
+            let listener = TcpListener::bind(self.tunnel_addr)
                 .await
                 .wrap_err("bind error")?;
+
+            // todo: we want to be able to do
+            //       `self.coord.send(Message::Accept)`
+            //
             if is_tunnel {
-                self.coord
+                self.ctrl
                     .as_mut()
                     .unwrap()
                     .write_u8(Message::Accept.into())
                     .await?;
             }
 
-            info!("waiting for spoke come up at {}", self.tunnel_addr);
-            let (stream, addr) = service_listener.accept().await?;
-            info!(?addr, "spoke connected!");
+            trace!("waiting for spoke at {}", self.tunnel_addr);
+            let (stream, addr) = listener.accept().await?;
+            trace!(?addr, "spoke connected!");
 
             // note: listener is dropped here to prevent mutiple spokes connected in
             (stream, addr)
         };
-        // todo: what happens the coordination conn breaks afterwards? reconnect.
 
         // really should use `tokio_util::codec`, but hey :), can't we be naive?
         // expect spoke to declare `coord` is a coordnation connection
@@ -243,9 +247,9 @@ impl Hub {
         ensure!(
             message
                 == if is_tunnel {
-                    Message::Tunnel
+                    Message::Data
                 } else {
-                    Message::Coord
+                    Message::Control
                 },
             "wrong type of connection established between the hub and spoke"
         );
@@ -278,21 +282,21 @@ impl Spoke {
 
         'outer: loop {
             // open up connection from spoke to the hub
-            info!("connecting to the hub {}", self.tunnel_addr);
+            trace!("connecting to the hub {}", self.tunnel_addr);
             let mut coord = loop {
                 match TcpStream::connect(self.tunnel_addr).await {
                     Ok(conn) => break conn,
                     Err(err) => {
                         tokio::time::sleep(Duration::from_secs(3)).await;
-                        warn!(?err, "failed to connect to the hub 127.0.0.1:4242");
+                        warn!(?err, "failed to connect to the hub {}", self.tunnel_addr);
                     }
                 }
             };
-            info!("connected to the hub");
-            info!("trying to establish a coordination connection");
+            trace!("connected to the hub");
+            trace!("opening control channel");
 
             coord
-                .write_u8(Message::Coord.into())
+                .write_u8(Message::Control.into())
                 .await
                 .wrap_err("failed to establish coordination connection with the hub")?;
 
@@ -302,9 +306,9 @@ impl Spoke {
                 "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
             );
 
-            info!("coordination connection established");
+            info!("✨ opened control channel!");
+            info!("all good! listening for connections");
 
-            info!("waiting for server to ask us to open a tunnel, because the server can't do that itself");
             loop {
                 let message: Message =
                     match coord.read_u8().await.wrap_err(
@@ -318,8 +322,8 @@ impl Spoke {
                     }
                     .into();
                 match message {
-                    Message::Coord => unreachable!(),
-                    Message::Tunnel => unreachable!(),
+                    Message::Control => unreachable!(),
+                    Message::Data => unreachable!(),
                     Message::Ack => unreachable!(),
                     Message::Accept => {
                         // tunnel creation error, maybe because hub is down, or maybe because
@@ -347,10 +351,10 @@ impl Spoke {
 
     #[instrument(skip(self))]
     async fn accept(&self) -> Result<()> {
-        info!("since the hub asked, we are opening a tunnel to hub");
+        trace!("since the hub asked, opening a data channel to the hub");
 
         // open up connection from spoke to the hub
-        info!("connecting to the hub {}", self.tunnel_addr);
+        trace!("connecting to the hub {}", self.tunnel_addr);
         let mut tunnel = loop {
             match TcpStream::connect(self.tunnel_addr).await {
                 Ok(conn) => break conn,
@@ -360,16 +364,17 @@ impl Spoke {
                 }
             }
         };
-        info!("connected to the hub");
-        info!("trying to establish a tunnel connection");
+        trace!("connected to the hub");
+        trace!("trying to establish a tunnel connection");
 
-        // the hub side of the tunnel could be closed, for unexpected reasons
-        // resulting in an error when `write_u8`, not good not terrible, we could
-        // reconnect. but for now we just give up
+        // actually tell the hub we want a data channel
+        // error: the hub side of the tunnel could be closed, for unexpected reasons
+        //        resulting in an error when `write_u8`, not good not terrible, we could
+        //        reconnect. but for now we just give up
         tunnel
-            .write_u8(Message::Tunnel.into())
+            .write_u8(Message::Data.into())
             .await
-            .wrap_err("failed to establish coordination connection with the hub")?;
+            .wrap_err("failed to open data channel")?;
 
         // same error, could retry but whatever
         let message: Message = tunnel.read_u8().await?.into();
@@ -378,9 +383,9 @@ impl Spoke {
             "can't establish hub -> spoke coordination connection"
         );
 
-        info!("tunnel established");
+        trace!("opened data channel");
 
-        info!("connecting to local serivce");
+        trace!("connecting to local serivce");
 
         // use some retry backoffs?
         // todo: maybe we shouldn't retry since it's local. when we can't connect,
@@ -391,12 +396,16 @@ impl Spoke {
                 Ok(conn) => break conn,
                 Err(err) => {
                     tokio::time::sleep(Duration::from_secs(3)).await;
-                    warn!(?err, "failed to connect to service {}", self.local_addr);
+                    warn!(
+                        ?err,
+                        "failed to connect to local service {}, is the service down?",
+                        self.local_addr
+                    );
                 }
             }
         };
 
-        info!("connected to local serivce, proxying");
+        info!("connected to local serivce, proxying to tunnel");
 
         // todo: what does copy do, exactly? copy tcp data sections?
         // what if serivce shutdown early? reconnect?
@@ -404,7 +413,7 @@ impl Spoke {
             .await
             .wrap_err("broken proxy between service and tunnel")?;
 
-        info!("closed");
+        trace!("tunnel closed");
 
         Ok(())
     }
