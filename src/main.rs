@@ -44,6 +44,10 @@ enum Commands {
         /// Tunnel port for connecting to the hub
         #[arg(short, long, default_value_t = 4242)]
         tunnel_port: u16,
+
+        /// Tunnel port for connecting to the hub
+        #[arg(short = 'i', long)]
+        tunnel_ip: std::net::IpAddr,
     },
 }
 
@@ -143,8 +147,8 @@ impl Hub {
             let (coord, _) = loop {
                 match self.server_establish_with_timeout().await {
                     Ok(conn) => break conn,
-                    Err(err) => {
-                        warn!(?err, "can't connect to spoke to establish coordination connection");
+                    Err(_) => {
+                        warn!("can't connect to spoke to establish coordination connection, is the spoke down?");
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -370,9 +374,9 @@ impl Spoke {
         // same error, could retry but whatever
         let message: Message = tunnel.read_u8().await?.into();
         ensure!(
-        message == Message::Ack,
-        "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
-    );
+            message == Message::Ack,
+            "can't establish hub -> spoke coordination connection"
+        );
 
         info!("tunnel established");
 
@@ -419,8 +423,12 @@ async fn main() -> Result<()> {
                 .run()
                 .await?;
         }
-        Commands::Spoke { port, tunnel_port } => {
-            Spoke::new(("0.0.0.0", port), ("0.0.0.0", tunnel_port))
+        Commands::Spoke {
+            port,
+            tunnel_port,
+            tunnel_ip,
+        } => {
+            Spoke::new(("0.0.0.0", port), (tunnel_ip, tunnel_port))
                 .run()
                 .await?;
         }
