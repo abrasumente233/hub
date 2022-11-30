@@ -75,24 +75,16 @@ pub struct Framed<I> {
     buffer: BytesMut,
 }
 
-// todo: use thiserror
-#[derive(Debug, Display, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum FramedError {
-    Io(std::io::Error),
-    Decode(DecodeError),
+    #[error("read IO error")]
+    Io(#[from] std::io::Error),
+
+    #[error("invalid message")]
+    Decode(#[from] DecodeError),
+
+    #[error("input incomplete")]
     Incomplete,
-}
-
-impl From<std::io::Error> for FramedError {
-    fn from(err: std::io::Error) -> Self {
-        FramedError::Io(err)
-    }
-}
-
-impl From<DecodeError> for FramedError {
-    fn from(err: DecodeError) -> Self {
-        FramedError::Decode(err)
-    }
 }
 
 impl<I> Framed<I> {
