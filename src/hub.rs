@@ -2,6 +2,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use color_eyre::eyre::{ensure, Result, WrapErr};
+use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, instrument, trace, warn};
@@ -11,7 +12,7 @@ use crate::handshake::*;
 pub struct Hub {
     exposed_addr: SocketAddr,
     tunnel_addr: SocketAddr,
-    ctrl: Option<Framed<TcpStream>>,
+    ctrl: Option<Framed>,
 }
 
 impl Hub {
@@ -82,9 +83,10 @@ impl Hub {
             // todo: one connection failure shouldn't bring down the whole system
             // fix these two unwrap
 
-            let (mut stream, mut buffer) = tunnel.into_parts();
-            client.write_buf(&mut buffer).await.unwrap(); // clean up read buffer
-            if tokio::io::copy_bidirectional(&mut client, &mut stream)
+            let mut parts = tunnel.into_parts();
+            assert!(parts.write_buf.is_empty());
+            client.write_buf(&mut parts.read_buf).await.unwrap(); // clean up read buffer
+            if tokio::io::copy_bidirectional(&mut client, &mut parts.io)
                 .await
                 .is_err()
             {
@@ -98,7 +100,7 @@ impl Hub {
     }
 
     /// Used by server to establish a connection with the spoke.
-    async fn open_chan(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
+    async fn open_chan(&mut self) -> Result<(Framed, SocketAddr)> {
         // todo: retry if at all question marks, only return error when timeout or
         // exceeded maximum retries.
         let is_tunnel = self.ctrl.is_some();
@@ -108,11 +110,7 @@ impl Hub {
                 .wrap_err("bind error")?;
 
             if is_tunnel {
-                self.ctrl
-                    .as_mut()
-                    .unwrap()
-                    .write_frame(Message::Accept)
-                    .await?;
+                self.ctrl.as_mut().unwrap().send(Message::Accept).await?;
             }
 
             trace!("waiting for spoke at {}", self.tunnel_addr);
@@ -123,10 +121,10 @@ impl Hub {
             (stream, addr)
         };
 
-        let mut stream = Framed::new(stream);
+        let mut stream = Framed::new(stream, FunCodec::new());
 
         // expect spoke to declare `ctrl` is a control channel
-        let message: Message = stream.read_frame().await?;
+        let message = stream.next().await.unwrap()?;
         ensure!(
             message
                 == if is_tunnel {
@@ -134,20 +132,20 @@ impl Hub {
                 } else {
                     Message::Control
                 },
-            "wrong type of connection established between the hub and spoke"
+            "wrong type of channel opened between the hub and spoke"
         );
-        stream.write_frame(Message::Ack).await?;
+        stream.send(Message::Ack).await?;
 
         Ok((stream, addr))
     }
 
-    async fn open_chan_timeout(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
+    async fn open_chan_timeout(&mut self) -> Result<(Framed, SocketAddr)> {
         tokio::time::timeout(Duration::from_secs(3), self.open_chan())
             .await
             .wrap_err("timeout establishing connection to the spoke, is the spoke up?")?
     }
 
-    async fn open_chan_retry(&mut self) -> (Framed<TcpStream>, SocketAddr) {
+    async fn open_chan_retry(&mut self) -> (Framed, SocketAddr) {
         loop {
             match self.open_chan_timeout().await {
                 Ok(conn) => break conn,

@@ -2,6 +2,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 use color_eyre::eyre::{ensure, Result, WrapErr};
+use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tracing::{info, instrument, trace, warn};
@@ -38,8 +39,9 @@ impl Spoke {
 
             loop {
                 let message = match ctrl
-                    .read_frame()
+                    .next()
                     .await
+                    .unwrap()
                     .wrap_err("control channel error, is the hub up?")
                 {
                     Ok(message) => message,
@@ -92,12 +94,13 @@ impl Spoke {
         ))?;
 
         // proxying
-        let (mut tunnel, mut buffer) = tunnel.into_parts();
+        let mut parts = tunnel.into_parts();
+        assert!(parts.write_buf.is_empty());
         service
-            .write_buf(&mut buffer)
+            .write_buf(&mut parts.read_buf)
             .await
             .wrap_err("broken proxy between service and tunnel")?; // clean up buffer
-        tokio::io::copy_bidirectional(&mut service, &mut tunnel)
+        tokio::io::copy_bidirectional(&mut service, &mut parts.io)
             .await
             .wrap_err("broken proxy between service and tunnel")?;
 
@@ -106,11 +109,11 @@ impl Spoke {
         Ok(())
     }
 
-    async fn open_chan_retry(addr: SocketAddr, chan_type: Message) -> Result<Framed<TcpStream>> {
+    async fn open_chan_retry(addr: SocketAddr, chan_type: Message) -> Result<Framed> {
         assert!(chan_type == Message::Data || chan_type == Message::Control);
         let mut chan = loop {
             match TcpStream::connect(addr).await {
-                Ok(conn) => break Framed::new(conn),
+                Ok(conn) => break Framed::new(conn, FunCodec::new()),
                 Err(err) => {
                     warn!(?err, "failed to connect to the hub {}", addr);
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -119,11 +122,11 @@ impl Spoke {
         };
 
         // handshakes
-        chan.write_frame(chan_type)
+        chan.send(chan_type)
             .await
             .wrap_err("failed to open control channel with the hub")?;
 
-        let message = chan.read_frame().await?;
+        let message = chan.next().await.unwrap()?;
 
         ensure!(
             message == Message::Ack,

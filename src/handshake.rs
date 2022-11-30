@@ -1,7 +1,6 @@
-use bytes::{Buf, BytesMut};
-use derive_more::{Display, Error};
+use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -19,129 +18,92 @@ pub enum Message {
     Accept = 4,
 }
 
-#[derive(Debug, PartialEq, Eq, Display, Error)]
-pub struct DecodeError;
+pub type Framed = tokio_util::codec::Framed<tokio::net::TcpStream, FunCodec>;
 
-impl TryFrom<u8> for Message {
-    type Error = DecodeError;
-
-    fn try_from(message: u8) -> Result<Self, Self::Error> {
-        use Message::*;
-        Ok(match message {
-            1 => Control,
-            2 => Data,
-            3 => Ack,
-            4 => Accept,
-            _ => return Err(DecodeError),
-        })
-    }
+#[derive(Debug, Clone)]
+pub struct FunCodec {
+    pub length_codec: LengthDelimitedCodec,
 }
-impl From<Message> for u8 {
-    fn from(message: Message) -> Self {
-        use Message::*;
-        match message {
-            Control => 1,
-            Data => 2,
-            Ack => 3,
-            Accept => 4,
+
+impl FunCodec {
+    pub fn new() -> Self {
+        Self {
+            length_codec: LengthDelimitedCodec::builder()
+                .length_field_type::<u16>()
+                .new_codec(),
         }
     }
-}
-
-impl Message {
-    fn check<B: Buf>(buf: &B) -> bool {
-        buf.remaining() >= 1
-    }
-}
-
-impl Message {
-    fn decode<B: Buf>(buf: &mut B) -> Result<Option<Self>, DecodeError> {
-        if !Message::check(buf) {
-            return Ok(None);
-        }
-
-        Message::try_from(buf.get_u8())
-            .map(Some)
-            .map_err(|_| DecodeError)
-    }
-
-    // fn encode(self, buf: BytesMut) {
-    //     buf.put_u8(self.into());
-    // }
-}
-
-pub struct Framed<I> {
-    io: I,
-    buffer: BytesMut,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum FramedError {
-    #[error("read IO error")]
+pub enum FunError {
+    #[error("IO error")]
     Io(#[from] std::io::Error),
 
-    #[error("invalid message")]
-    Decode(#[from] DecodeError),
-
-    #[error("input incomplete")]
-    Incomplete,
+    #[error("decode error")]
+    Decode(#[from] serde_json::Error),
 }
 
-impl<I> Framed<I> {
-    pub fn new(io: I) -> Self {
-        Self {
-            io,
-            buffer: BytesMut::new(),
-        }
-    }
+impl Decoder for FunCodec {
+    type Item = Message;
+    type Error = FunError;
 
-    pub async fn read_frame(&mut self) -> Result<Message, FramedError>
-    where
-        I: AsyncRead + Unpin,
-    {
-        loop {
-            match Message::decode(&mut self.buffer)? {
-                Some(message) => break Ok(message),
-                None => {
-                    if 0 == self.io.read_buf(&mut self.buffer).await? {
-                        return Err(FramedError::Incomplete);
-                    }
-                }
-            }
-        }
-    }
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        let src = match self.length_codec.decode(src) {
+            Ok(Some(src)) => src,
+            Ok(None) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
 
-    pub async fn write_frame(&mut self, message: Message) -> std::io::Result<()>
-    where
-        I: AsyncWrite + Unpin,
-    {
-        self.io.write_u8(message.into()).await?;
+        Ok(Some(serde_json::from_slice(&src[..])?))
+    }
+}
+
+impl Encoder<Message> for FunCodec {
+    type Error = FunError;
+
+    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let buf = serde_json::to_vec(&item)?;
+        let buf = bytes::Bytes::from(buf);
+
+        self.length_codec.encode(buf, dst)?;
+
         Ok(())
-    }
-
-    pub fn into_parts(self) -> (I, BytesMut) {
-        (self.io, self.buffer)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::AsyncReadExt;
+
     use super::*;
 
     #[tokio::test]
-    async fn test_codec() {
+    async fn test_tokio_codec() {
+        let codec = FunCodec::new();
+
+        let (client, server) = tokio::io::duplex(64);
+        let mut client = tokio_util::codec::Framed::new(client, codec.clone());
+        let mut server = tokio_util::codec::Framed::new(server, codec);
+
+        client.send(Message::Ack).await.unwrap();
+
+        assert_eq!(server.next().await.unwrap().unwrap(), Message::Ack);
+    }
+
+    #[tokio::test]
+    async fn test_tokio_codec_peek() {
+        let codec = FunCodec::new();
+
         let (client, mut server) = tokio::io::duplex(64);
+        let mut client = tokio_util::codec::Framed::new(client, codec.clone());
 
-        // write invalid data
-        server.write_u8(233).await.unwrap();
+        client.send(Message::Ack).await.unwrap();
 
-        // frame both stream
-        let (mut client, mut server) = (Framed::new(client), Framed::new(server));
+        let mut buf = BytesMut::new();
+        server.read_buf(&mut buf).await.unwrap();
 
-        assert!(client.read_frame().await.is_err());
-
-        // normal data
-        server.write_frame(Message::Ack).await.unwrap();
-        assert_eq!(client.read_frame().await.unwrap(), Message::Ack);
+        dbg!(buf);
     }
 }
