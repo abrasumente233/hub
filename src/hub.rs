@@ -1,7 +1,7 @@
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use color_eyre::eyre::{ensure, Result, WrapErr};
+use color_eyre::eyre::{bail, ensure, ContextCompat, Result, WrapErr};
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -9,20 +9,23 @@ use tracing::{info, instrument, trace, warn};
 
 use crate::handshake::*;
 
+const DEFAULT_EXPOSED_PORT: u16 = 1337;
+
 pub struct Hub {
-    exposed_addr: SocketAddr,
+    exposed_addr: IpAddr,
+    exposed_port: Option<u16>,
     tunnel_addr: SocketAddr,
     ctrl: Option<Framed>,
 }
 
 impl Hub {
-    pub fn new<A1, A2>(exposed_addr: A1, tunnel_addr: A2) -> Self
+    pub fn new<A>(exposed_addr: IpAddr, exposed_port: Option<u16>, tunnel_addr: A) -> Self
     where
-        A1: ToSocketAddrs,
-        A2: ToSocketAddrs,
+        A: ToSocketAddrs,
     {
         Self {
-            exposed_addr: exposed_addr.to_socket_addrs().unwrap().next().unwrap(),
+            exposed_addr,
+            exposed_port,
             tunnel_addr: tunnel_addr.to_socket_addrs().unwrap().next().unwrap(),
             ctrl: None,
         }
@@ -43,9 +46,17 @@ impl Hub {
             let (ctrl, _) = self.open_chan_retry().await;
             self.ctrl.replace(ctrl);
 
-            let listener = TcpListener::bind(self.exposed_addr).await?;
+            let listener = TcpListener::bind((
+                self.exposed_addr,
+                self.exposed_port.unwrap_or(DEFAULT_EXPOSED_PORT),
+            ))
+            .await?;
             info!("✨ all good! listening for connections");
-            info!("service exposed at {}", self.exposed_addr);
+            info!(
+                "service exposed at {}:{}",
+                self.exposed_addr,
+                self.exposed_port.unwrap_or(DEFAULT_EXPOSED_PORT)
+            );
 
             loop {
                 let (client, client_addr) = listener.accept().await?;
@@ -124,16 +135,23 @@ impl Hub {
         let mut stream = Framed::new(stream, FunCodec::new());
 
         // expect spoke to declare `ctrl` is a control channel
-        let message = stream.next().await.unwrap()?;
-        ensure!(
-            message
-                == if is_tunnel {
-                    Message::Data
-                } else {
-                    Message::Control
-                },
-            "wrong type of channel opened between the hub and spoke"
-        );
+        let message = stream.next().await.context("connection reset by peer")??;
+        if is_tunnel {
+            ensure!(
+                message == Message::Data,
+                "wrong type of channel opened between the hub and spoke"
+            );
+        } else {
+            match message {
+                Message::Control { service_port } => {
+                    if self.exposed_port.is_none() {
+                        self.exposed_port.replace(service_port);
+                    }
+                }
+                _ => bail!("wrong type of channel opened between the hub and spoke"),
+            }
+        }
+
         stream.send(Message::Ack).await?;
 
         Ok((stream, addr))

@@ -7,7 +7,7 @@ Expose your TCP service behind NAT to remote host.
 ### functionalities
 
 - [x] command line interface for specifying hub `ip:port` and exposed port
-- [ ] default exposed port should be the original service port, as provided by the spoke
+- [x] default exposed port should be the original service port, as provided by the spoke
 - [x] simplify the handshakes code
 - [ ] authentication
 

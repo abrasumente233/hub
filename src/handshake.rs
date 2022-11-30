@@ -6,16 +6,16 @@ use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Message {
     /// Used by spoke to open a control channel
-    Control = 1,
+    Control { service_port: u16 },
 
     /// Used by spoke to open a data channel
-    Data = 2,
+    Data,
 
     /// Used by hub to acknowledge a message sent by the spoke
-    Ack = 3,
+    Ack,
 
     /// Used by hub to tell the spoke to open a data channel
-    Accept = 4,
+    Accept,
 }
 
 pub type Framed = tokio_util::codec::Framed<tokio::net::TcpStream, FunCodec>;

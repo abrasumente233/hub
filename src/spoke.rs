@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use color_eyre::eyre::{ensure, Result, WrapErr};
+use color_eyre::eyre::{ensure, ContextCompat, Result, WrapErr};
 use futures::{SinkExt, StreamExt};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -33,7 +33,13 @@ impl Spoke {
         'reconnect: loop {
             // open control channel
             trace!("opening control channel to {}", self.tunnel_addr);
-            let mut ctrl = Self::open_chan_retry(self.tunnel_addr, Message::Control).await?;
+            let mut ctrl = Self::open_chan_retry(
+                self.tunnel_addr,
+                Message::Control {
+                    service_port: self.local_addr.port(),
+                },
+            )
+            .await?;
 
             info!("✨ all good! listening for connections");
 
@@ -41,7 +47,7 @@ impl Spoke {
                 let message = match ctrl
                     .next()
                     .await
-                    .unwrap()
+                    .context("connection reset by peer")?
                     .wrap_err("control channel error, is the hub up?")
                 {
                     Ok(message) => message,
@@ -51,7 +57,7 @@ impl Spoke {
                     }
                 };
                 match message {
-                    Message::Control => unreachable!(),
+                    Message::Control { .. } => unreachable!(),
                     Message::Data => unreachable!(),
                     Message::Ack => unreachable!(),
                     Message::Accept => {
@@ -110,7 +116,7 @@ impl Spoke {
     }
 
     async fn open_chan_retry(addr: SocketAddr, chan_type: Message) -> Result<Framed> {
-        assert!(chan_type == Message::Data || chan_type == Message::Control);
+        matches!(chan_type, Message::Data | Message::Control { .. });
         let mut chan = loop {
             match TcpStream::connect(addr).await {
                 Ok(conn) => break Framed::new(conn, FunCodec::new()),
@@ -126,7 +132,7 @@ impl Spoke {
             .await
             .wrap_err("failed to open control channel with the hub")?;
 
-        let message = chan.next().await.unwrap()?;
+        let message = chan.next().await.context("connection reset by peer")??;
 
         ensure!(
             message == Message::Ack,
