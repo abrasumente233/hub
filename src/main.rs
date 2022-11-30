@@ -100,39 +100,29 @@ impl Hub {
     // if control channel breaks?
     async fn run(&mut self) -> Result<()> {
         info!(
-            "✨ running the hub at {{exposed_addr={}, tunnel_addr={}}}!",
+            "✨ running the hub at (exposed_addr={}, tunnel_addr={})!",
             self.exposed_addr, self.tunnel_addr
         );
 
-        'outer: loop {
-            // if we can't open control channel, there's nothing we can do, so bail out.
+        'reconnect: loop {
             info!("opening control channel");
-            let (ctrl, _) = loop {
-                match self.server_establish_with_timeout().await {
-                    Ok(conn) => break conn,
-                    Err(_) => {
-                        warn!("can't open control channel, is the spoke up?");
-                    }
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            };
+            let (ctrl, _) = self.open_chan_retry().await;
             self.ctrl.replace(ctrl);
-            info!("✨ opened control channel!");
-            info!("all good! listening for connections");
 
             let listener = TcpListener::bind(self.exposed_addr).await?;
-
+            info!("✨ all good! listening for connections");
             info!("service exposed at {}", self.exposed_addr);
+
             loop {
                 let (client, client_addr) = listener.accept().await?;
 
                 match self.handle_server_connection(client, client_addr).await {
                     Ok(_) => (),
                     Err(err) => {
-                        warn!(?err);
                         // can't connect to the spoke, reconnect
+                        warn!(?err);
                         self.ctrl.take();
-                        continue 'outer;
+                        continue 'reconnect;
                     }
                 };
             }
@@ -146,12 +136,10 @@ impl Hub {
         mut client: TcpStream,
         client_addr: SocketAddr,
     ) -> Result<()> {
-        trace!(?client_addr, "connected");
-
         trace!("asking the spoke to open up a data channel");
 
         let (tunnel, tunnel_addr) = self
-            .server_establish_with_timeout()
+            .open_chan_timeout()
             .await
             .wrap_err("can't open data channel")?;
 
@@ -177,7 +165,7 @@ impl Hub {
     }
 
     /// Used by server to establish a connection with the spoke.
-    async fn server_establish(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
+    async fn open_chan(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
         // todo: retry if at all question marks, only return error when timeout or
         // exceeded maximum retries.
         let is_tunnel = self.ctrl.is_some();
@@ -220,10 +208,22 @@ impl Hub {
         Ok((stream, addr))
     }
 
-    async fn server_establish_with_timeout(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
-        tokio::time::timeout(Duration::from_secs(3), self.server_establish())
+    async fn open_chan_timeout(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
+        tokio::time::timeout(Duration::from_secs(3), self.open_chan())
             .await
             .wrap_err("timeout establishing connection to the spoke, is the spoke up?")?
+    }
+
+    async fn open_chan_retry(&mut self) -> (Framed<TcpStream>, SocketAddr) {
+        loop {
+            match self.open_chan_timeout().await {
+                Ok(conn) => break conn,
+                Err(_) => {
+                    warn!("can't open tunnel, is the spoke up?");
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
     }
 }
 
@@ -242,35 +242,12 @@ impl Spoke {
     async fn run(&self) -> Result<()> {
         info!("✨ running the spoke!");
 
-        'outer: loop {
-            // open up connection from spoke to the hub
-            trace!("connecting to the hub {}", self.tunnel_addr);
-            let ctrl = loop {
-                match TcpStream::connect(self.tunnel_addr).await {
-                    Ok(conn) => break conn,
-                    Err(err) => {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        warn!(?err, "failed to connect to the hub {}", self.tunnel_addr);
-                    }
-                }
-            };
-            trace!("connected to the hub");
-            trace!("opening control channel");
+        'reconnect: loop {
+            // open control channel
+            trace!("opening control channel to {}", self.tunnel_addr);
+            let mut ctrl = Self::open_chan_retry(self.tunnel_addr, Message::Control).await?;
 
-            let mut ctrl = Framed::new(ctrl);
-
-            ctrl.write_frame(Message::Control)
-                .await
-                .wrap_err("failed to open control channel with the hub")?;
-
-            let message = ctrl.read_frame().await?;
-            ensure!(
-                message == Message::Ack,
-                "the hub should have acked our request to open a control channel, but it won't"
-            );
-
-            info!("✨ opened control channel!");
-            info!("all good! listening for connections");
+            info!("✨ all good! listening for connections");
 
             loop {
                 let message = match ctrl
@@ -281,7 +258,7 @@ impl Spoke {
                     Ok(message) => message,
                     Err(err) => {
                         warn!(?err);
-                        continue 'outer;
+                        continue 'reconnect;
                     }
                 };
                 match message {
@@ -316,46 +293,18 @@ impl Spoke {
     async fn accept(&self) -> Result<()> {
         trace!("since the hub asked, opening a data channel to the hub");
 
-        // open up connection from spoke to the hub
-        trace!("connecting to the hub {}", self.tunnel_addr);
-        let tunnel = loop {
-            match TcpStream::connect(self.tunnel_addr).await {
-                Ok(conn) => break conn,
-                Err(err) => {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    warn!(?err, "failed to connect to the hub {}", self.tunnel_addr);
-                }
-            }
-        };
-        let mut tunnel = Framed::new(tunnel);
-        trace!("connected to the hub");
-        trace!("trying to establish a tunnel connection");
+        // open data channel
+        trace!("opening data channel to {}", self.tunnel_addr);
+        let tunnel = Self::open_chan_retry(self.tunnel_addr, Message::Data).await?;
 
-        // actually tell the hub we want a data channel
-        // error: the hub side of the tunnel could be closed, for unexpected reasons
-        //        resulting in an error when `write_u8`, not good not terrible, we could
-        //        reconnect. but for now we just give up
-        tunnel
-            .write_frame(Message::Data)
-            .await
-            .wrap_err("failed to open data channel")?;
-
-        // same error, could retry but whatever
-        let message: Message = tunnel.read_frame().await?;
-        ensure!(
-            message == Message::Ack,
-            "can't establish hub -> spoke control channel"
-        );
-
-        trace!("opened data channel");
-
+        // connect to local service
         trace!("connecting to local serivce");
-
         let mut service = TcpStream::connect(self.local_addr).await.wrap_err(format!(
             "can't connect to local service {}, is the local service up?",
             self.local_addr
         ))?;
 
+        // proxying
         let (mut tunnel, mut buffer) = tunnel.into_parts();
         service
             .write_buf(&mut buffer)
@@ -368,6 +317,33 @@ impl Spoke {
         trace!("tunnel closed");
 
         Ok(())
+    }
+
+    async fn open_chan_retry(addr: SocketAddr, chan_type: Message) -> Result<Framed<TcpStream>> {
+        assert!(chan_type == Message::Data || chan_type == Message::Control);
+        let mut chan = loop {
+            match TcpStream::connect(addr).await {
+                Ok(conn) => break Framed::new(conn),
+                Err(err) => {
+                    warn!(?err, "failed to connect to the hub {}", addr);
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                }
+            }
+        };
+
+        // handshakes
+        chan.write_frame(chan_type)
+            .await
+            .wrap_err("failed to open control channel with the hub")?;
+
+        let message = chan.read_frame().await?;
+
+        ensure!(
+            message == Message::Ack,
+            "the hub should have acked our request to open a control channel, but it won't"
+        );
+
+        Ok(chan)
     }
 }
 
