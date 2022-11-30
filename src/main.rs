@@ -95,9 +95,9 @@ impl Hub {
     }
 
     // it's going banana cakes, the amount of failure points is getting
-    // crazy at this point. for example, any coordination error will boil
+    // crazy at this point. for example, any control chan error will boil
     // down to reconnecting, but how do you know, when calling a function,
-    // if coordination breaks?
+    // if control channel breaks?
     async fn run(&mut self) -> Result<()> {
         info!(
             "✨ running the hub at {{exposed_addr={}, tunnel_addr={}}}!",
@@ -105,18 +105,18 @@ impl Hub {
         );
 
         'outer: loop {
-            // if we can't establish coordination, there's nothing we can do, so bail out.
+            // if we can't open control channel, there's nothing we can do, so bail out.
             info!("opening control channel");
-            let (coord, _) = loop {
+            let (ctrl, _) = loop {
                 match self.server_establish_with_timeout().await {
                     Ok(conn) => break conn,
                     Err(_) => {
-                        warn!("can't open control channel, is the spoke down?");
+                        warn!("can't open control channel, is the spoke up?");
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             };
-            self.ctrl.replace(coord);
+            self.ctrl.replace(ctrl);
             info!("✨ opened control channel!");
             info!("all good! listening for connections");
 
@@ -140,7 +140,7 @@ impl Hub {
     }
 
     /// Returns error when we can't connect to the spoke
-    #[instrument(skip(self, client))]
+    #[instrument(level = "trace", skip(self, client))]
     async fn handle_server_connection(
         &mut self,
         mut client: TcpStream,
@@ -157,17 +157,18 @@ impl Hub {
 
         trace!(?tunnel_addr, "opened data channel");
 
-        info!("tunneling");
-
         tokio::spawn(async move {
             // todo: one connection failure shouldn't bring down the whole system
             // fix these two unwrap
 
             let (mut stream, mut buffer) = tunnel.into_parts();
             client.write_buf(&mut buffer).await.unwrap(); // clean up read buffer
-            tokio::io::copy_bidirectional(&mut client, &mut stream)
+            if tokio::io::copy_bidirectional(&mut client, &mut stream)
                 .await
-                .unwrap();
+                .is_err()
+            {
+                warn!("connection reset by peer");
+            }
 
             trace!("data channel closed");
         });
@@ -176,9 +177,6 @@ impl Hub {
     }
 
     /// Used by server to establish a connection with the spoke.
-    ///
-    /// If `coord` is `Some`, this function will try to establish a
-    /// tunnel connection, otherwise a coordination connection.
     async fn server_establish(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
         // todo: retry if at all question marks, only return error when timeout or
         // exceeded maximum retries.
@@ -188,9 +186,6 @@ impl Hub {
                 .await
                 .wrap_err("bind error")?;
 
-            // todo: we want to be able to do
-            //       `self.coord.send(Message::Accept)`
-            //
             if is_tunnel {
                 self.ctrl
                     .as_mut()
@@ -209,8 +204,7 @@ impl Hub {
 
         let mut stream = Framed::new(stream);
 
-        // really should use `tokio_util::codec`, but hey :), can't we be naive?
-        // expect spoke to declare `coord` is a coordnation connection
+        // expect spoke to declare `ctrl` is a control channel
         let message: Message = stream.read_frame().await?;
         ensure!(
             message
@@ -229,7 +223,7 @@ impl Hub {
     async fn server_establish_with_timeout(&mut self) -> Result<(Framed<TcpStream>, SocketAddr)> {
         tokio::time::timeout(Duration::from_secs(3), self.server_establish())
             .await
-            .wrap_err("timeout establishing connection to the spoke, is the spoke down?")?
+            .wrap_err("timeout establishing connection to the spoke, is the spoke up?")?
     }
 }
 
@@ -251,7 +245,7 @@ impl Spoke {
         'outer: loop {
             // open up connection from spoke to the hub
             trace!("connecting to the hub {}", self.tunnel_addr);
-            let coord = loop {
+            let ctrl = loop {
                 match TcpStream::connect(self.tunnel_addr).await {
                     Ok(conn) => break conn,
                     Err(err) => {
@@ -263,33 +257,33 @@ impl Spoke {
             trace!("connected to the hub");
             trace!("opening control channel");
 
-            let mut coord = Framed::new(coord);
+            let mut ctrl = Framed::new(ctrl);
 
-            coord
-                .write_frame(Message::Control)
+            ctrl.write_frame(Message::Control)
                 .await
-                .wrap_err("failed to establish coordination connection with the hub")?;
+                .wrap_err("failed to open control channel with the hub")?;
 
-            let message = coord.read_frame().await?;
+            let message = ctrl.read_frame().await?;
             ensure!(
                 message == Message::Ack,
-                "the hub should have acked our request to establish a coordination connection, but it won't, who's to blame?"
+                "the hub should have acked our request to open a control channel, but it won't"
             );
 
             info!("✨ opened control channel!");
             info!("all good! listening for connections");
 
             loop {
-                let message =
-                    match coord.read_frame().await.wrap_err(
-                        "coordination channel encounters unexpected EOF, is the hub down?",
-                    ) {
-                        Ok(message) => message,
-                        Err(err) => {
-                            warn!(?err);
-                            continue 'outer;
-                        }
-                    };
+                let message = match ctrl
+                    .read_frame()
+                    .await
+                    .wrap_err("control channel error, is the hub up?")
+                {
+                    Ok(message) => message,
+                    Err(err) => {
+                        warn!(?err);
+                        continue 'outer;
+                    }
+                };
                 match message {
                     Message::Control => unreachable!(),
                     Message::Data => unreachable!(),
@@ -318,7 +312,7 @@ impl Spoke {
         }
     }
 
-    #[instrument(skip(self))]
+    #[instrument(level = "trace", skip(self))]
     async fn accept(&self) -> Result<()> {
         trace!("since the hub asked, opening a data channel to the hub");
 
@@ -350,36 +344,19 @@ impl Spoke {
         let message: Message = tunnel.read_frame().await?;
         ensure!(
             message == Message::Ack,
-            "can't establish hub -> spoke coordination connection"
+            "can't establish hub -> spoke control channel"
         );
 
         trace!("opened data channel");
 
         trace!("connecting to local serivce");
 
-        // use some retry backoffs?
-        // todo: maybe we shouldn't retry since it's local. when we can't connect,
-        // it's more likely that the service is down, rather than there's a
-        // network issue...
-        let mut service = loop {
-            match TcpStream::connect(self.local_addr).await {
-                Ok(conn) => break conn,
-                Err(err) => {
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    warn!(
-                        ?err,
-                        "failed to connect to local service {}, is the service down?",
-                        self.local_addr
-                    );
-                }
-            }
-        };
-
-        info!("connected to local serivce, proxying to tunnel");
+        let mut service = TcpStream::connect(self.local_addr).await.wrap_err(format!(
+            "can't connect to local service {}, is the local service up?",
+            self.local_addr
+        ))?;
 
         let (mut tunnel, mut buffer) = tunnel.into_parts();
-        // todo: what does copy do, exactly? copy tcp data sections?
-        // what if serivce shutdown early? reconnect?
         service
             .write_buf(&mut buffer)
             .await
