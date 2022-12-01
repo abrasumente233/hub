@@ -100,7 +100,7 @@ jobs:
           docker run --rm -v \
             "$PWD/target:/target:Z" \
             rustembedded/cross:${{ matrix.target }} \
-            aarch64-linux-gnu-strip \
+            ${{ matrix.target }}-strip \
             /target/${{ matrix.target }}/release/$BIN_NAME
 
       - name: Build archive
