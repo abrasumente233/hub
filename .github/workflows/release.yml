@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false # don't fail other jobs if one fails
       matrix:
-        build: [x86_64-linux, aarch64-linux, x86_64-macos, x86_64-windows, aarch64-macos] #, x86_64-win-gnu, win32-msvc
+        build: [x86_64-linux-gnu, x86_64-linux-musl, aarch64-linux-gnu, aarch64-linux-musl, x86_64-macos, x86_64-windows, aarch64-macos]
         include:
         - build: x86_64-linux-gnu
           os: ubuntu-20.04
