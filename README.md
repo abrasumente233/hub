@@ -13,7 +13,8 @@ Expose your TCP service behind NAT to remote host.
 
 ### would be nice if we have
 
-- [ ] prebuilt binaries for multiple platforms, including musl builds for Linux
+- [x] prebuilt binaries for multiple platforms, including musl builds for Linux
+- [ ] prebuilt binaries for arm32 and 32-bit x86? although nobody would use it, nah.
 - [x] cleaned up all my shitty code and logs
 - [ ] cleaned up more shitty code
 - [ ] clearer error handling logic...
