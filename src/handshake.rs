@@ -1,9 +1,13 @@
 use bytes::BytesMut;
+use hmac::Hmac;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use tokio_util::codec::{Decoder, Encoder, LengthDelimitedCodec};
 
+pub type HmacSha256 = Hmac<Sha256>;
+
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Message {
     /// Used by spoke to open a control channel
     Control { service_port: u16 },
@@ -13,6 +17,12 @@ pub enum Message {
 
     /// Used by hub to acknowledge a message sent by the spoke
     Ack,
+
+    /// Used by hub to challenge whether if the spoke holds the key
+    Challenge { payload: Vec<u8> },
+
+    /// Used by hub to challenge whether if the spoke holds the key
+    Answer(Vec<u8>),
 
     /// Used by hub to tell the spoke to open a data channel
     Accept,

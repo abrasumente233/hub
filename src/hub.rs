@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use color_eyre::eyre::{bail, ensure, ContextCompat, Result, WrapErr};
 use futures::{SinkExt, StreamExt};
+use hmac::digest::Mac;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, instrument, trace, warn};
@@ -16,10 +17,16 @@ pub struct Hub {
     exposed_port: Option<u16>,
     tunnel_addr: SocketAddr,
     ctrl: Option<Framed>,
+    key: Option<String>,
 }
 
 impl Hub {
-    pub fn new<A>(exposed_addr: IpAddr, exposed_port: Option<u16>, tunnel_addr: A) -> Self
+    pub fn new<A>(
+        exposed_addr: IpAddr,
+        exposed_port: Option<u16>,
+        tunnel_addr: A,
+        key: Option<String>,
+    ) -> Self
     where
         A: ToSocketAddrs,
     {
@@ -28,6 +35,7 @@ impl Hub {
             exposed_port,
             tunnel_addr: tunnel_addr.to_socket_addrs().unwrap().next().unwrap(),
             ctrl: None,
+            key,
         }
     }
 
@@ -135,6 +143,7 @@ impl Hub {
         let mut stream = Framed::new(stream, FunCodec::new());
 
         // expect spoke to declare `ctrl` is a control channel
+        // todo: this is so ugly, why?
         let message = stream.next().await.context("connection reset by peer")??;
         if is_tunnel {
             ensure!(
@@ -149,6 +158,38 @@ impl Hub {
                     }
                 }
                 _ => bail!("wrong type of channel opened between the hub and spoke"),
+            }
+        }
+
+        if self.key.is_some() {
+            // challenge the spoke to see whether it has the key
+            let challenge = uuid::Uuid::new_v4().into_bytes().to_vec();
+
+            stream
+                .send(Message::Challenge {
+                    payload: challenge.clone(), // todo: use array instead of
+                                                // vec!
+                })
+                .await?;
+
+            let mut code = HmacSha256::new_from_slice(b"top secret").unwrap();
+            code.update(&challenge);
+
+            let message = stream.next().await.context("connection reset by peer")??;
+
+            match message {
+                Message::Answer(answer) => {
+                    if code.verify_slice(&answer).is_err() {
+                        warn!("auth failed");
+                        bail!("auth failed");
+                    }
+                }
+                _ => bail!("auth failed"),
+            }
+
+            // auth passed, ack back
+            if !is_tunnel {
+                info!("auth succeeded!");
             }
         }
 
